@@ -9,8 +9,15 @@
 				width: image.width,
 				height: image.height,
 				render,
+				friction: 0.5,
+				centerBounds: {
+					left: 400,
+					right: 800,
+					top: 100,
+					bottom: 1000,
+				}
 			})
-		image.src = './svelte-kit-machine.webp'
+		image.src = './solid-color-image.png'
 
 		function render(ctx: CanvasRenderingContext2D, _t: number, _focus: Point) {
 			ctx.drawImage(image, 0, 0)

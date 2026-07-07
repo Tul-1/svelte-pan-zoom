@@ -1,381 +1,447 @@
-import { disablePreload } from 'svelte-disable-preload'
-import { resize } from 'svelte-resize-observer-action'
+import { disablePreload } from "svelte-disable-preload";
+import { resize } from "svelte-resize-observer-action";
 
 export interface Point {
-  x: number
-  y: number
+    x: number;
+    y: number;
 }
 
 interface TrackedPoint {
-  point: Point
-  t: number   // time
+    point: Point;
+    t: number; // time
 }
 
 interface Velocity {
-  vx: number
-  vy: number
-  ts: number
+    vx: number;
+    vy: number;
+    ts: number;
 }
 
 // some basic 2d geometry
-const distance = (p1: Point, p2: Point) => Math.hypot(p1.x - p2.x, p1.y - p2.y)
-const midpoint = (p1: Point, p2: Point) => <Point>{ x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 }
-const subtract = (p1: Point, p2: Point) => <Point>{ x: p1.x - p2.x, y: p1.y - p2.y }
+const distance = (p1: Point, p2: Point) => Math.hypot(p1.x - p2.x, p1.y - p2.y);
+const midpoint = (p1: Point, p2: Point) =>
+    <Point>{ x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
+const subtract = (p1: Point, p2: Point) =>
+    <Point>{ x: p1.x - p2.x, y: p1.y - p2.y };
 
-const MIN_VELOCITY = 0.02
-const TRACKED_DURATION = 120
+const MIN_VELOCITY = 0.02;
+const TRACKED_DURATION = 120;
 
 // return boolean indicates if rAF renders should be scheduled
 // (i.e. there may be some animation that has to play)
-type Render = (ctx: CanvasRenderingContext2D, t: number, focus: Point) => void | boolean
+type Render = (
+    ctx: CanvasRenderingContext2D,
+    t: number,
+    focus: Point,
+) => void | boolean;
+
+export interface Bounds {
+    top?: number; // Max distance you can pan past the top edge (in image space)
+    bottom?: number; // Max distance you can pan past the bottom edge
+    left?: number; // Max distance you can pan past the left edge
+    right?: number; // Max distance you can pan past the right edge
+}
 
 export interface Options {
-  width: number
-  height: number
-  render: Render
-  padding?: number
-  maxZoom?: number
-  friction?: number
+    width: number;
+    height: number;
+    render: Render;
+    padding?: number;
+    maxZoom?: number;
+    friction?: number;
+    centerBounds?: Partial<Bounds>;
 }
 
 export function panzoom(canvas: HTMLCanvasElement, options: Options) {
-  const dpr = window.devicePixelRatio
-  const ctx = canvas.getContext('2d')!
-  const rAF = requestAnimationFrame
+    const dpr = window.devicePixelRatio;
+    const ctx = canvas.getContext("2d")!;
+    const rAF = requestAnimationFrame;
 
-  let minZoom: number
-  let width: number
-  let height: number
-  let render: Render
-  let padding: number
-  let maxZoom: number
-  let friction: number
-  let view_width = canvas.width = canvas.clientWidth * dpr
-  let view_height = canvas.height = canvas.clientHeight * dpr
-  let focus: Point
-  let frame = 0
-  let velocity: Velocity = { vx: 0, vy: 0, ts: 0 }
+    let minZoom: number;
+    let width: number;
+    let height: number;
+    let render: Render;
+    let padding: number;
+    let maxZoom: number;
+    let friction: number;
+    let view_width = (canvas.width = canvas.clientWidth * dpr);
+    let view_height = (canvas.height = canvas.clientHeight * dpr);
+    let focus: Point;
+    let frame = 0;
+    let velocity: Velocity = { vx: 0, vy: 0, ts: 0 };
 
-  // active pointer count and positions
-  const pointers = new Map<number, Point>()
+    let centerBounds: Bounds = {
+        left: 0,
+        right: 0,
+        top: 0,
+        bottom: 0,
+    };
 
-  // tracking for momentum
-  const tracked: TrackedPoint[] = []
+    // active pointer count and positions
+    const pointers = new Map<number, Point>();
 
-  function initialize(options: Options) {
-    ({ width, height, render, padding, maxZoom, friction } = { padding: 0, maxZoom: 16, friction: 0.97, ...options })
+    // tracking for momentum
+    const tracked: TrackedPoint[] = [];
 
-    minZoom = Math.min(
-      canvas.width / (width + (padding * dpr)),
-      canvas.height / (height + (padding * dpr))
-    )
+    function initialize(options: Options) {
+        ({ width, height, render, padding, maxZoom, friction } = {
+            padding: 0,
+            maxZoom: 16,
+            friction: 0.97,
+            ...options,
+        });
 
-    // transform so that 0, 0 is center of image in center of canvas
-    ctx.resetTransform()
-    ctx.translate(canvas.width / 2, canvas.height / 2)
-    ctx.scale(minZoom, minZoom)
-    ctx.translate(-width / 2, -height / 2)
+        minZoom = Math.min(
+            canvas.width / (width + padding),
+            canvas.height / (height + padding),
+        ) / 2;
 
-    stopMovement()
+        // Calculate halfway across the canvas in image space units
+        const defaultHalfWidthImgSpace = canvas.width / 2 / minZoom;
+        const defaultHalfHeightImgSpace = canvas.height / 2 / minZoom;
 
-    focus = toImageSpace({ x: canvas.width / 2, y: canvas.height / 2 })
+        // Fall back to the calculated halfway limits if not explicitly provided
+        centerBounds = {
+            left: options.centerBounds?.left ?? defaultHalfWidthImgSpace,
+            right: options.centerBounds?.right ?? defaultHalfWidthImgSpace,
+            top: options.centerBounds?.top ?? defaultHalfHeightImgSpace,
+            bottom: options.centerBounds?.bottom ?? defaultHalfHeightImgSpace,
+        };
 
-    scheduleRender()
-  }
+        // transform so that 0, 0 is center of image in center of canvas
+        ctx.resetTransform();
+        ctx.translate(canvas.width / 2, canvas.height / 2);
+        ctx.scale(minZoom, minZoom);
+        ctx.translate(-width / 2, -height / 2);
 
-  initialize(options)
+        stopMovement();
 
-  const preloadAction = disablePreload(canvas)
-  const resizeAction = resize(canvas, entry => {
-    // Do not resize if canvas is hidden
-    if(canvas.clientWidth === 0 && canvas.clientHeight === 0){
-      return
-    }
-    
-    const rect = entry.contentRect
-    const prev = toImageSpace({ x: view_width / 2, y: view_height / 2 })
-    const transform = ctx.getTransform()
+        focus = toImageSpace({ x: canvas.width / 2, y: canvas.height / 2 });
 
-    view_width = rect.width * dpr
-    view_height = rect.height * dpr
-
-    canvas.width = view_width
-    canvas.height = view_height
-
-    minZoom = Math.min(
-      canvas.width / (options.width + (padding * dpr)),
-      canvas.height / (options.height + (padding * dpr))
-    )
-
-    ctx.setTransform(transform)
-
-    focus = toImageSpace({ x: view_width / 2, y: view_height / 2 })
-
-    ctx.translate(focus.x - prev.x, focus.y - prev.y)
-
-    // if not animating, we need to repaint
-    if (!frame) {
-      renderFrame(performance.now())
-    }
-  })
-
-  // prune the tracked events based on age
-  function prune(t: number) {
-    while (tracked.length && t - tracked[0].t > TRACKED_DURATION) {
-      tracked.shift()
-    }
-  }
-
-  function track(point: Point) {
-    const t = performance.now()
-
-    prune(t)
-
-    tracked.push({ point, t })
-  }
-
-  function stopMovement() {
-    if (frame) {
-      cancelAnimationFrame(frame)
-      frame = 0
+        scheduleRender();
     }
 
-    velocity.vx = 0
-    velocity.vy = 0
-    tracked.length = 0
-  }
+    initialize(options);
 
-  // constrain image to viewport and "bounce" off trailing image edges
-  function checkBounds() {
-    const tl = toImageSpace({ x: 0, y: 0 })
-    const br = toImageSpace({ x: canvas.width, y: canvas.height })
-
-    if (tl.x > width) {
-      ctx.translate(tl.x - width, 0)
-      velocity.vx = -velocity.vx
-    }
-
-    if (tl.y > height) {
-      ctx.translate(0, tl.y - height)
-      velocity.vy = -velocity.vy
-    }
-
-    if (br.x < 0) {
-      ctx.translate(br.x, 0)
-      velocity.vx = -velocity.vx
-    }
-
-    if (br.y < 0) {
-      ctx.translate(0, br.y)
-      velocity.vy = -velocity.vy
-    }
-  }
-
-  function onpointerdown(event: PointerEvent) {
-    event.stopPropagation()
-    canvas.setPointerCapture(event.pointerId)
-
-    const point = pointFromEvent(event)
-    pointers.set(event.pointerId, point)
-
-    stopMovement()
-  }
-
-  function onpointerend(event: PointerEvent) {
-    event.stopPropagation()
-    canvas.releasePointerCapture(event.pointerId)
-
-    pointers.delete(event.pointerId)
-
-    // if last pointer, check for velocity
-    if (pointers.size === 0) {
-      prune(performance.now())
-
-      if (tracked.length > 1) {
-        // calc movement
-        const oldest = tracked[0]
-        const latest = tracked[tracked.length - 1]
-
-        // calc velocity
-        const x = latest.point.x - oldest.point.x
-        const y = latest.point.y - oldest.point.y
-        const t = latest.t - oldest.t
-
-        velocity = {
-          vx: x / t,
-          vy: y / t,
-          ts: performance.now()
+    const preloadAction = disablePreload(canvas);
+    const resizeAction = resize(canvas, (entry) => {
+        if (canvas.clientWidth === 0 && canvas.clientHeight === 0) {
+            return;
         }
 
-        scheduleRender()
-      }
-    }
-  }
+        const rect = entry.contentRect;
+        const prev = toImageSpace({ x: view_width / 2, y: view_height / 2 });
+        const transform = ctx.getTransform();
 
-  function onpointermove(event: PointerEvent) {
-    event.stopPropagation()
+        view_width = rect.width * dpr;
+        view_height = rect.height * dpr;
 
-    // ignore if pointer not pressed
-    if (!pointers.has(event.pointerId)) return
+        canvas.width = view_width;
+        canvas.height = view_height;
 
-    const point = pointFromEvent(event)
+        minZoom = Math.min(
+            canvas.width / (options.width + padding),
+            canvas.height / (options.height + padding),
+        ) / 2;
 
-    switch (pointers.size) {
-      // single pointer move (pan)
-      case 1: {
-        const curr = toImageSpace(point)
-        track(curr)
+        // Recalculate dynamic defaults on resize
+        const defaultHalfWidthImgSpace = canvas.width / 2 / minZoom;
+        const defaultHalfHeightImgSpace = canvas.height / 2 / minZoom;
 
-        const prev = pointers.get(event.pointerId)!
-        const diff = subtract(curr, toImageSpace(prev))
+        centerBounds = {
+            left: options.centerBounds?.left ?? defaultHalfWidthImgSpace,
+            right: options.centerBounds?.right ?? defaultHalfWidthImgSpace,
+            top: options.centerBounds?.top ?? defaultHalfHeightImgSpace,
+            bottom: options.centerBounds?.bottom ?? defaultHalfHeightImgSpace,
+        };
 
-        focus = curr
+        ctx.setTransform(transform);
 
-        moveBy(diff)
-        scheduleRender()
+        focus = toImageSpace({ x: view_width / 2, y: view_height / 2 });
 
-        pointers.set(event.pointerId, point)
+        ctx.translate(focus.x - prev.x, focus.y - prev.y);
 
-        break
-      }
-      // two pointer move (pinch zoom _and_ pan)
-      case 2: {
-        let points = [...pointers.values()]
-        let p1 = toImageSpace(points[0])
-        let p2 = toImageSpace(points[1])
-        const prev_middle = midpoint(p1, p2)
-        const prev_dist = distance(p1, p2)
+        if (!frame) {
+            renderFrame(performance.now());
+        }
+    });
 
-        pointers.set(event.pointerId, point)
-
-        points = [...pointers.values()]
-        p1 = toImageSpace(points[0])
-        p2 = toImageSpace(points[1])
-        const middle = midpoint(p1, p2)
-        const dist = distance(p1, p2)
-
-        // move by distance that midpoint moved
-        const diff = subtract(middle, prev_middle)
-        moveBy(diff)
-
-        // zoom by ratio of pinch sizes, on current middle
-        const zoom = dist / prev_dist
-        zoomOn(middle, zoom)
-
-        break
-      }
-    }
-  }
-
-  function onwheel(event: WheelEvent) {
-    event.preventDefault()
-    event.stopPropagation()
-
-    const point = pointFromEvent(event)
-    const z = Math.exp(-event.deltaY / 512)
-
-    zoomOn(toImageSpace(point), z)
-  }
-
-  function moveBy(delta: Point) {
-    ctx.translate(delta.x, delta.y)
-    checkBounds()
-  }
-
-  function zoomOn(point: Point, zoom: number) {
-    function scale(value: number) {
-      ctx.translate(point.x, point.y)
-      ctx.scale(value, value)
-      ctx.translate(-point.x, -point.y)
+    // prune the tracked events based on age
+    function prune(t: number) {
+        while (tracked.length && t - tracked[0].t > TRACKED_DURATION) {
+            tracked.shift();
+        }
     }
 
-    scale(zoom)
+    function track(point: Point) {
+        const t = performance.now();
 
-    const transform = ctx.getTransform()
+        prune(t);
 
-    // limit min zoom to initial image size
-    if (transform.a < minZoom) {
-      scale(minZoom / transform.a)
+        tracked.push({ point, t });
     }
 
-    // limit max zoom to "OMG, I see the pixels so large!"
-    if (transform.a > maxZoom) {
-      scale(maxZoom / transform.a)
+    function stopMovement() {
+        if (frame) {
+            cancelAnimationFrame(frame);
+            frame = 0;
+        }
+
+        velocity.vx = 0;
+        velocity.vy = 0;
+        tracked.length = 0;
     }
 
-    focus = point
+    // constrain image to viewport do not "bounce" off trailing image edges
+    function checkBounds() {
+        // 1. Get the current viewport center in image space
+        const viewCenter = toImageSpace({
+            x: canvas.width / 2,
+            y: canvas.height / 2,
+        });
 
-    scheduleRender()
-  }
+        // 2. Define the ideal target image center
+        const imageCenterX = width / 2;
+        const imageCenterY = height / 2;
 
-  function pointFromEvent(event: PointerEvent | WheelEvent): Point {
-    // point is in canvas space
-    return { x: event.offsetX * dpr, y: event.offsetY * dpr }
-  }
+        // 3. Calculate drift relative to the center
+        // If driftX is positive, the view has moved RIGHT of the image center.
+        // If driftX is negative, the view has moved LEFT of the image center.
+        const driftX = viewCenter.x - imageCenterX;
+        const driftY = viewCenter.y - imageCenterY;
 
-  function toImageSpace(point: Point): Point {
-    const inverse = ctx.getTransform().inverse()
-    return inverse.transformPoint(point)
-  }
+        // 4. Clamp Horizontal Bounds
+        if (driftX > (centerBounds.right ?? 0)) {
+            // Moved too far right
+            ctx.translate(driftX - (centerBounds.right ?? 0), 0);
+            velocity.vx = 0;
+        } else if (driftX < -(centerBounds.left ?? 0)) {
+            // Moved too far left
+            ctx.translate(driftX + (centerBounds.left ?? 0), 0);
+            velocity.vx = 0;
+        }
 
-  function scheduleRender() {
-    if (!frame) {
-      frame = rAF(renderFrame)
-    }
-  }
-
-  function renderFrame(t: number) {
-    ctx.save()
-    ctx.resetTransform()
-    ctx.clearRect(0, 0, canvas.width, canvas.height)
-    ctx.restore()
-
-    const playing = render(ctx, t, focus)
-
-    const transform = ctx.getTransform()
-    const distance = Math.sqrt(velocity.vx * velocity.vx + velocity.vy * velocity.vy) * transform.a
-    const moving = distance > MIN_VELOCITY
-
-    if (moving) {
-      const ts = t - velocity.ts
-      const x = velocity.vx * ts
-      const y = velocity.vy * ts
-
-      moveBy({ x, y })
-
-      velocity.vx *= friction
-      velocity.vy *= friction
-      velocity.ts = t
+        // 5. Clamp Vertical Bounds
+        if (driftY > (centerBounds.bottom ?? 0)) {
+            // Moved too far down
+            ctx.translate(0, driftY - (centerBounds.bottom ?? 0));
+            velocity.vy = 0;
+        } else if (driftY < -(centerBounds.top ?? 0)) {
+            // Moved too far up
+            ctx.translate(0, driftY + (centerBounds.top ?? 0));
+            velocity.vy = 0;
+        }
     }
 
-    if (moving || playing) {
-      frame = rAF(renderFrame)
-    } else {
-      frame = 0
+    function onpointerdown(event: PointerEvent) {
+        event.stopPropagation();
+        canvas.setPointerCapture(event.pointerId);
+
+        const point = pointFromEvent(event);
+        pointers.set(event.pointerId, point);
+
+        stopMovement();
     }
-  }
 
-  const makePassive = { passive: true }
+    function onpointerend(event: PointerEvent) {
+        event.stopPropagation();
+        canvas.releasePointerCapture(event.pointerId);
 
-  canvas.addEventListener('pointerdown', onpointerdown, makePassive)
-  canvas.addEventListener('pointerup', onpointerend, makePassive)
-  canvas.addEventListener('pointercancel', onpointerend, makePassive)
-  canvas.addEventListener('pointermove', onpointermove, makePassive)
-  canvas.addEventListener('wheel', onwheel)
+        pointers.delete(event.pointerId);
 
-  return {
-    update(options: Options) {
-      initialize(options)
-    },
-    destroy() {
-      preloadAction.destroy()
-      resizeAction.destroy()
+        // if last pointer, check for velocity
+        if (pointers.size === 0) {
+            prune(performance.now());
 
-      canvas.removeEventListener('pointerdown', onpointerdown)
-      canvas.removeEventListener('pointerup', onpointerend)
-      canvas.removeEventListener('pointercancel', onpointerend)
-      canvas.removeEventListener('pointermove', onpointermove)
-      canvas.removeEventListener('wheel', onwheel)
+            if (tracked.length > 1) {
+                // calc movement
+                const oldest = tracked[0];
+                const latest = tracked[tracked.length - 1];
+
+                // calc velocity
+                const x = latest.point.x - oldest.point.x;
+                const y = latest.point.y - oldest.point.y;
+                const t = latest.t - oldest.t;
+
+                if (t > 0) {
+                    velocity = {
+                        vx: x / t,
+                        vy: y / t,
+                        ts: performance.now(),
+                    };
+                }
+
+                scheduleRender();
+            }
+        }
     }
-  }
+
+    function onpointermove(event: PointerEvent) {
+        event.stopPropagation();
+
+        // ignore if pointer not pressed
+        if (!pointers.has(event.pointerId)) return;
+
+        const point = pointFromEvent(event);
+
+        switch (pointers.size) {
+            // single pointer move (pan)
+            case 1: {
+                const curr = toImageSpace(point);
+                track(curr);
+
+                const prev = pointers.get(event.pointerId)!;
+                const diff = subtract(curr, toImageSpace(prev));
+
+                focus = curr;
+
+                moveBy(diff);
+                scheduleRender();
+
+                pointers.set(event.pointerId, point);
+
+                break;
+            }
+            // two pointer move (pinch zoom _and_ pan)
+            case 2: {
+                let points = [...pointers.values()];
+                let p1 = toImageSpace(points[0]);
+                let p2 = toImageSpace(points[1]);
+                const prev_middle = midpoint(p1, p2);
+                const prev_dist = distance(p1, p2);
+
+                pointers.set(event.pointerId, point);
+
+                points = [...pointers.values()];
+                p1 = toImageSpace(points[0]);
+                p2 = toImageSpace(points[1]);
+                const middle = midpoint(p1, p2);
+                const dist = distance(p1, p2);
+
+                // move by distance that midpoint moved
+                const diff = subtract(middle, prev_middle);
+                moveBy(diff);
+
+                // zoom by ratio of pinch sizes, on current middle
+                const zoom = dist / prev_dist;
+                zoomOn(middle, zoom);
+
+                break;
+            }
+        }
+    }
+
+    function onwheel(event: WheelEvent) {
+        event.preventDefault();
+        event.stopPropagation();
+
+        const point = pointFromEvent(event);
+        const z = Math.exp(-event.deltaY / 512);
+
+        zoomOn(toImageSpace(point), z);
+    }
+
+    function moveBy(delta: Point) {
+        ctx.translate(delta.x, delta.y);
+        checkBounds();
+    }
+
+    function zoomOn(point: Point, zoom: number) {
+        function scale(value: number) {
+            ctx.translate(point.x, point.y);
+            ctx.scale(value, value);
+            ctx.translate(-point.x, -point.y);
+        }
+
+        scale(zoom);
+
+        const transform = ctx.getTransform();
+
+        // limit min zoom to initial image size
+        if (transform.a < minZoom) {
+            scale(minZoom / transform.a);
+        }
+
+        // limit max zoom to "OMG, I see the pixels so large!"
+        if (transform.a > maxZoom) {
+            scale(maxZoom / transform.a);
+        }
+
+        focus = point;
+
+        scheduleRender();
+    }
+
+    function pointFromEvent(event: PointerEvent | WheelEvent): Point {
+        // point is in canvas space
+        return { x: event.offsetX * dpr, y: event.offsetY * dpr };
+    }
+
+    function toImageSpace(point: Point): Point {
+        const inverse = ctx.getTransform().inverse();
+        return inverse.transformPoint(point);
+    }
+
+    function scheduleRender() {
+        if (!frame) {
+            frame = rAF(renderFrame);
+        }
+    }
+
+    function renderFrame(t: number) {
+        ctx.save();
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.restore();
+
+        const playing = render(ctx, t, focus);
+
+        const transform = ctx.getTransform();
+        const distance =
+            Math.sqrt(velocity.vx * velocity.vx + velocity.vy * velocity.vy) *
+            transform.a;
+        const moving = distance > MIN_VELOCITY;
+
+        if (moving) {
+            const ts = t - velocity.ts;
+            const x = velocity.vx * ts;
+            const y = velocity.vy * ts;
+
+            moveBy({ x, y });
+
+            velocity.vx *= friction;
+            velocity.vy *= friction;
+            velocity.ts = t;
+        }
+
+        if (moving || playing) {
+            frame = rAF(renderFrame);
+        } else {
+            frame = 0;
+        }
+    }
+
+    const makePassive = { passive: true };
+
+    canvas.addEventListener("pointerdown", onpointerdown, makePassive);
+    canvas.addEventListener("pointerup", onpointerend, makePassive);
+    canvas.addEventListener("pointercancel", onpointerend, makePassive);
+    canvas.addEventListener("pointermove", onpointermove, makePassive);
+    canvas.addEventListener("wheel", onwheel);
+
+    return {
+        update(options: Options) {
+            initialize(options);
+        },
+        destroy() {
+            preloadAction.destroy();
+            resizeAction.destroy();
+
+            canvas.removeEventListener("pointerdown", onpointerdown);
+            canvas.removeEventListener("pointerup", onpointerend);
+            canvas.removeEventListener("pointercancel", onpointerend);
+            canvas.removeEventListener("pointermove", onpointermove);
+            canvas.removeEventListener("wheel", onwheel);
+        },
+    };
 }
