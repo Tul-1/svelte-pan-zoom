@@ -10,12 +10,6 @@
 				height: image.height,
 				render,
 				friction: 0.5,
-				centerBounds: {
-					left: 400,
-					right: 800,
-					top: 100,
-					bottom: 1000,
-				}
 			})
 		image.src = './solid-color-image.png'
 

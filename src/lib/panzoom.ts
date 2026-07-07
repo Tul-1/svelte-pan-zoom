@@ -8,7 +8,7 @@ export interface Point {
 
 interface TrackedPoint {
     point: Point;
-    t: number; // time
+    t: number;
 }
 
 interface Velocity {
@@ -17,7 +17,13 @@ interface Velocity {
     ts: number;
 }
 
-// some basic 2d geometry
+interface Bounds {
+    left: number;
+    right: number;
+    top: number;
+    bottom: number;
+}
+
 const distance = (p1: Point, p2: Point) => Math.hypot(p1.x - p2.x, p1.y - p2.y);
 const midpoint = (p1: Point, p2: Point) =>
     <Point>{ x: (p1.x + p2.x) / 2, y: (p1.y + p2.y) / 2 };
@@ -27,20 +33,11 @@ const subtract = (p1: Point, p2: Point) =>
 const MIN_VELOCITY = 0.02;
 const TRACKED_DURATION = 120;
 
-// return boolean indicates if rAF renders should be scheduled
-// (i.e. there may be some animation that has to play)
 type Render = (
     ctx: CanvasRenderingContext2D,
     t: number,
     focus: Point,
 ) => void | boolean;
-
-export interface Bounds {
-    top?: number; // Max distance you can pan past the top edge (in image space)
-    bottom?: number; // Max distance you can pan past the bottom edge
-    left?: number; // Max distance you can pan past the left edge
-    right?: number; // Max distance you can pan past the right edge
-}
 
 export interface Options {
     width: number;
@@ -48,8 +45,9 @@ export interface Options {
     render: Render;
     padding?: number;
     maxZoom?: number;
+    minZoomMultiplier?: number;
     friction?: number;
-    centerBounds?: Partial<Bounds>;
+    visibilityBounds?: Partial<Bounds>;
 }
 
 export function panzoom(canvas: HTMLCanvasElement, options: Options) {
@@ -57,12 +55,14 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
     const ctx = canvas.getContext("2d")!;
     const rAF = requestAnimationFrame;
 
+    let baseZoom: number;
     let minZoom: number;
     let width: number;
     let height: number;
     let render: Render;
     let padding: number;
     let maxZoom: number;
+    let minZoomMultiplier: number;
     let friction: number;
     let view_width = (canvas.width = canvas.clientWidth * dpr);
     let view_height = (canvas.height = canvas.clientHeight * dpr);
@@ -70,55 +70,80 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
     let frame = 0;
     let velocity: Velocity = { vx: 0, vy: 0, ts: 0 };
 
-    let centerBounds: Bounds = {
-        left: 0,
-        right: 0,
-        top: 0,
-        bottom: 0,
-    };
+    let visibilityBounds: Required<Bounds>;
 
-    // active pointer count and positions
+    // Concrete image-space boundaries (absolute edge positions)
+    let absoluteBounds: Required<Bounds>;
+
     const pointers = new Map<number, Point>();
-
-    // tracking for momentum
     const tracked: TrackedPoint[] = [];
 
     function initialize(options: Options) {
-        ({ width, height, render, padding, maxZoom, friction } = {
+        ({
+            width,
+            height,
+            render,
+            padding,
+            maxZoom,
+            minZoomMultiplier,
+            friction,
+        } = {
             padding: 0,
             maxZoom: 16,
+            minZoomMultiplier: 0.5,
             friction: 0.97,
             ...options,
         });
 
-        minZoom = Math.min(
+        baseZoom = Math.min(
             canvas.width / (width + padding),
             canvas.height / (height + padding),
-        ) / 2;
+        );
 
-        // Calculate halfway across the canvas in image space units
-        const defaultHalfWidthImgSpace = canvas.width / 2 / minZoom;
-        const defaultHalfHeightImgSpace = canvas.height / 2 / minZoom;
-
-        // Fall back to the calculated halfway limits if not explicitly provided
-        centerBounds = {
-            left: options.centerBounds?.left ?? defaultHalfWidthImgSpace,
-            right: options.centerBounds?.right ?? defaultHalfWidthImgSpace,
-            top: options.centerBounds?.top ?? defaultHalfHeightImgSpace,
-            bottom: options.centerBounds?.bottom ?? defaultHalfHeightImgSpace,
+        visibilityBounds = {
+            left: options.visibilityBounds?.left ?? 0.5,
+            right: options.visibilityBounds?.right ?? 0.5,
+            top: options.visibilityBounds?.top ?? 0.5,
+            bottom: options.visibilityBounds?.bottom ?? 0.5,
         };
 
-        // transform so that 0, 0 is center of image in center of canvas
+        calculateAbsoluteBounds();
+
         ctx.resetTransform();
         ctx.translate(canvas.width / 2, canvas.height / 2);
-        ctx.scale(minZoom, minZoom);
+        ctx.scale(baseZoom, baseZoom);
         ctx.translate(-width / 2, -height / 2);
 
         stopMovement();
-
         focus = toImageSpace({ x: canvas.width / 2, y: canvas.height / 2 });
 
+        // Ensure constraints are satisfied immediately on boot
+        checkBounds();
         scheduleRender();
+    }
+
+    // Maps the visibility fractions to absolute coordinate limits in image-space
+    function calculateAbsoluteBounds() {
+        const allowedInvisibleW = canvas.width / 2 / baseZoom;
+        const allowedInvisibleH = canvas.height / 2 / baseZoom;
+
+        absoluteBounds = {
+            left: 0 - allowedInvisibleW * (1 - visibilityBounds.left),
+            right: width + allowedInvisibleW * (1 - visibilityBounds.right),
+            top: 0 - allowedInvisibleH * (1 - visibilityBounds.top),
+            bottom: height + allowedInvisibleH * (1 - visibilityBounds.bottom),
+        };
+
+        // Enforce a dynamic minimum zoom floor to prevent visibility thresholds from revealing structural void space
+        const boundWidth = absoluteBounds.right - absoluteBounds.left;
+        const boundHeight = absoluteBounds.bottom - absoluteBounds.top;
+
+        const strictMinZoom = Math.max(
+            canvas.width / boundWidth,
+            canvas.height / boundHeight,
+        );
+
+        minZoom = Math.max(baseZoom * minZoomMultiplier, strictMinZoom);
     }
 
     initialize(options);
@@ -139,34 +164,24 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
         canvas.width = view_width;
         canvas.height = view_height;
 
-        minZoom = Math.min(
+        baseZoom = Math.min(
             canvas.width / (options.width + padding),
             canvas.height / (options.height + padding),
-        ) / 2;
+        );
 
-        // Recalculate dynamic defaults on resize
-        const defaultHalfWidthImgSpace = canvas.width / 2 / minZoom;
-        const defaultHalfHeightImgSpace = canvas.height / 2 / minZoom;
-
-        centerBounds = {
-            left: options.centerBounds?.left ?? defaultHalfWidthImgSpace,
-            right: options.centerBounds?.right ?? defaultHalfWidthImgSpace,
-            top: options.centerBounds?.top ?? defaultHalfHeightImgSpace,
-            bottom: options.centerBounds?.bottom ?? defaultHalfHeightImgSpace,
-        };
+        calculateAbsoluteBounds();
 
         ctx.setTransform(transform);
-
         focus = toImageSpace({ x: view_width / 2, y: view_height / 2 });
-
         ctx.translate(focus.x - prev.x, focus.y - prev.y);
+
+        checkBounds();
 
         if (!frame) {
             renderFrame(performance.now());
         }
     });
 
-    // prune the tracked events based on age
     function prune(t: number) {
         while (tracked.length && t - tracked[0].t > TRACKED_DURATION) {
             tracked.shift();
@@ -175,9 +190,7 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
 
     function track(point: Point) {
         const t = performance.now();
-
         prune(t);
-
         tracked.push({ point, t });
     }
 
@@ -186,49 +199,31 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
             cancelAnimationFrame(frame);
             frame = 0;
         }
-
         velocity.vx = 0;
         velocity.vy = 0;
         tracked.length = 0;
     }
 
-    // constrain image to viewport do not "bounce" off trailing image edges
+    // Advanced Map-Style Bounds Clamping Engine (Viewport Edge Constraining & Inertia Absorption)
     function checkBounds() {
-        // 1. Get the current viewport center in image space
-        const viewCenter = toImageSpace({
-            x: canvas.width / 2,
-            y: canvas.height / 2,
-        });
+        const tl = toImageSpace({ x: 0, y: 0 });
+        const br = toImageSpace({ x: canvas.width, y: canvas.height });
 
-        // 2. Define the ideal target image center
-        const imageCenterX = width / 2;
-        const imageCenterY = height / 2;
-
-        // 3. Calculate drift relative to the center
-        // If driftX is positive, the view has moved RIGHT of the image center.
-        // If driftX is negative, the view has moved LEFT of the image center.
-        const driftX = viewCenter.x - imageCenterX;
-        const driftY = viewCenter.y - imageCenterY;
-
-        // 4. Clamp Horizontal Bounds
-        if (driftX > (centerBounds.right ?? 0)) {
-            // Moved too far right
-            ctx.translate(driftX - (centerBounds.right ?? 0), 0);
-            velocity.vx = 0;
-        } else if (driftX < -(centerBounds.left ?? 0)) {
-            // Moved too far left
-            ctx.translate(driftX + (centerBounds.left ?? 0), 0);
+        // Horizontal Evaluation
+        if (tl.x < absoluteBounds.left) {
+            ctx.translate(tl.x - absoluteBounds.left, 0);
+            velocity.vx = 0; // Absorbs kinetic inertia on wall collision
+        } else if (br.x > absoluteBounds.right) {
+            ctx.translate(br.x - absoluteBounds.right, 0);
             velocity.vx = 0;
         }
 
-        // 5. Clamp Vertical Bounds
-        if (driftY > (centerBounds.bottom ?? 0)) {
-            // Moved too far down
-            ctx.translate(0, driftY - (centerBounds.bottom ?? 0));
+        // Vertical Evaluation
+        if (tl.y < absoluteBounds.top) {
+            ctx.translate(0, tl.y - absoluteBounds.top);
             velocity.vy = 0;
-        } else if (driftY < -(centerBounds.top ?? 0)) {
-            // Moved too far up
-            ctx.translate(0, driftY + (centerBounds.top ?? 0));
+        } else if (br.y > absoluteBounds.bottom) {
+            ctx.translate(0, br.y - absoluteBounds.bottom);
             velocity.vy = 0;
         }
     }
@@ -249,16 +244,13 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
 
         pointers.delete(event.pointerId);
 
-        // if last pointer, check for velocity
         if (pointers.size === 0) {
             prune(performance.now());
 
             if (tracked.length > 1) {
-                // calc movement
                 const oldest = tracked[0];
                 const latest = tracked[tracked.length - 1];
 
-                // calc velocity
                 const x = latest.point.x - oldest.point.x;
                 const y = latest.point.y - oldest.point.y;
                 const t = latest.t - oldest.t;
@@ -278,14 +270,11 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
 
     function onpointermove(event: PointerEvent) {
         event.stopPropagation();
-
-        // ignore if pointer not pressed
         if (!pointers.has(event.pointerId)) return;
 
         const point = pointFromEvent(event);
 
         switch (pointers.size) {
-            // single pointer move (pan)
             case 1: {
                 const curr = toImageSpace(point);
                 track(curr);
@@ -299,10 +288,8 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
                 scheduleRender();
 
                 pointers.set(event.pointerId, point);
-
                 break;
             }
-            // two pointer move (pinch zoom _and_ pan)
             case 2: {
                 let points = [...pointers.values()];
                 let p1 = toImageSpace(points[0]);
@@ -318,14 +305,11 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
                 const middle = midpoint(p1, p2);
                 const dist = distance(p1, p2);
 
-                // move by distance that midpoint moved
                 const diff = subtract(middle, prev_middle);
                 moveBy(diff);
 
-                // zoom by ratio of pinch sizes, on current middle
                 const zoom = dist / prev_dist;
                 zoomOn(middle, zoom);
-
                 break;
             }
         }
@@ -346,6 +330,7 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
         checkBounds();
     }
 
+    // Camera Zoom Anchoring Module
     function zoomOn(point: Point, zoom: number) {
         function scale(value: number) {
             ctx.translate(point.x, point.y);
@@ -355,25 +340,25 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
 
         scale(zoom);
 
-        const transform = ctx.getTransform();
+        let transform = ctx.getTransform();
 
-        // limit min zoom to initial image size
         if (transform.a < minZoom) {
             scale(minZoom / transform.a);
         }
 
-        // limit max zoom to "OMG, I see the pixels so large!"
         if (transform.a > maxZoom) {
             scale(maxZoom / transform.a);
         }
 
         focus = point;
 
+        // Map style interaction: Run checkbounds mid-zoom execution to
+        // cleanly push camera coordinates inward if zooming along margins.
+        checkBounds();
         scheduleRender();
     }
 
     function pointFromEvent(event: PointerEvent | WheelEvent): Point {
-        // point is in canvas space
         return { x: event.offsetX * dpr, y: event.offsetY * dpr };
     }
 
@@ -397,10 +382,10 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
         const playing = render(ctx, t, focus);
 
         const transform = ctx.getTransform();
-        const distance =
+        const dist =
             Math.sqrt(velocity.vx * velocity.vx + velocity.vy * velocity.vy) *
             transform.a;
-        const moving = distance > MIN_VELOCITY;
+        const moving = dist > MIN_VELOCITY;
 
         if (moving) {
             const ts = t - velocity.ts;
