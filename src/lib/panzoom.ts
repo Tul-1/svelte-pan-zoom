@@ -71,8 +71,6 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
     let velocity: Velocity = { vx: 0, vy: 0, ts: 0 };
 
     let visibilityBounds: Required<Bounds>;
-
-    // Concrete image-space boundaries (absolute edge positions)
     let absoluteBounds: Required<Bounds>;
 
     const pointers = new Map<number, Point>();
@@ -117,12 +115,10 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
         stopMovement();
         focus = toImageSpace({ x: canvas.width / 2, y: canvas.height / 2 });
 
-        // Ensure constraints are satisfied immediately on boot
         checkBounds();
         scheduleRender();
     }
 
-    // Maps the visibility fractions to absolute coordinate limits in image-space
     function calculateAbsoluteBounds() {
         const allowedInvisibleW = canvas.width / 2 / baseZoom;
         const allowedInvisibleH = canvas.height / 2 / baseZoom;
@@ -134,7 +130,6 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
             bottom: height + allowedInvisibleH * (1 - visibilityBounds.bottom),
         };
 
-        // Enforce a dynamic minimum zoom floor to prevent visibility thresholds from revealing structural void space
         const boundWidth = absoluteBounds.right - absoluteBounds.left;
         const boundHeight = absoluteBounds.bottom - absoluteBounds.top;
 
@@ -204,21 +199,18 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
         tracked.length = 0;
     }
 
-    // Advanced Map-Style Bounds Clamping Engine (Viewport Edge Constraining & Inertia Absorption)
     function checkBounds() {
         const tl = toImageSpace({ x: 0, y: 0 });
         const br = toImageSpace({ x: canvas.width, y: canvas.height });
 
-        // Horizontal Evaluation
         if (tl.x < absoluteBounds.left) {
             ctx.translate(tl.x - absoluteBounds.left, 0);
-            velocity.vx = 0; // Absorbs kinetic inertia on wall collision
+            velocity.vx = 0;
         } else if (br.x > absoluteBounds.right) {
             ctx.translate(br.x - absoluteBounds.right, 0);
             velocity.vx = 0;
         }
 
-        // Vertical Evaluation
         if (tl.y < absoluteBounds.top) {
             ctx.translate(0, tl.y - absoluteBounds.top);
             velocity.vy = 0;
@@ -330,30 +322,46 @@ export function panzoom(canvas: HTMLCanvasElement, options: Options) {
         checkBounds();
     }
 
-    // Camera Zoom Anchoring Module
+    // Map-Style Edge-Smart Zoom Module
     function zoomOn(point: Point, zoom: number) {
-        function scale(value: number) {
-            ctx.translate(point.x, point.y);
-            ctx.scale(value, value);
-            ctx.translate(-point.x, -point.y);
+        const currentTransform = ctx.getTransform();
+        let targetScale = currentTransform.a * zoom;
+
+        // Clamp scale factor to limits first
+        if (targetScale < minZoom) targetScale = minZoom;
+        if (targetScale > maxZoom) targetScale = maxZoom;
+
+        const effectiveZoom = targetScale / currentTransform.a;
+
+        // 1. Predictive view sizing calculations in image-space
+        const futureWidthImg = canvas.width / targetScale;
+        const futureHeightImg = canvas.height / targetScale;
+
+        // 2. Compute where the boundaries land relative to our intended anchor point
+        let leftBoundOffset = point.x - absoluteBounds.left;
+        let rightBoundOffset = absoluteBounds.right - point.x;
+        let topBoundOffset = point.y - absoluteBounds.top;
+        let bottomBoundOffset = absoluteBounds.bottom - point.y;
+
+        // 3. Shift anchor point coordinates inward if the scale pulls edges past limits
+        if (leftBoundOffset * effectiveZoom < 0) {
+            point.x = absoluteBounds.left;
+        } else if (rightBoundOffset * effectiveZoom < futureWidthImg) {
+            point.x = absoluteBounds.right - futureWidthImg;
         }
 
-        scale(zoom);
-
-        let transform = ctx.getTransform();
-
-        if (transform.a < minZoom) {
-            scale(minZoom / transform.a);
+        if (topBoundOffset * effectiveZoom < 0) {
+            point.y = absoluteBounds.top;
+        } else if (bottomBoundOffset * effectiveZoom < futureHeightImg) {
+            point.y = absoluteBounds.bottom - futureHeightImg;
         }
 
-        if (transform.a > maxZoom) {
-            scale(maxZoom / transform.a);
-        }
+        // 4. Apply scale transformations with the adjusted, boundary-safe anchor point
+        ctx.translate(point.x, point.y);
+        ctx.scale(effectiveZoom, effectiveZoom);
+        ctx.translate(-point.x, -point.y);
 
         focus = point;
-
-        // Map style interaction: Run checkbounds mid-zoom execution to
-        // cleanly push camera coordinates inward if zooming along margins.
         checkBounds();
         scheduleRender();
     }

@@ -11,7 +11,7 @@
 				render,
 				friction: 0.5,
 			})
-		image.src = './solid-color-image.png'
+		image.src = './grid-pattern-rectangle.png'
 
 		function render(ctx: CanvasRenderingContext2D, _t: number, _focus: Point) {
 			ctx.drawImage(image, 0, 0)
